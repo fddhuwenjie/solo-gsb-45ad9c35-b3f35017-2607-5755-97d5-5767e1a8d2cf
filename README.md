@@ -17,7 +17,10 @@
 对**同一 MMSI、同一 UTC observed_at**被多个接收站同时上报的情况，服务还维护一份**船位冲突清单**：
 不同 `source_id` 实际保存在轨迹中、未作废且经纬度齐全的船位，两点大圆距离**严格超过 1852 米**
 （1 海里）时记一条来源对冲突，由 `GET /position-conflicts` 查询（双方来源、坐标与距离，
-按时间、MMSI、来源 ID 排序）。
+按时间、MMSI、来源 ID 排序）。对**同源同船轨迹**，服务另维护一份**疑似跳跃航段清单**：
+按 `observed_at` 相邻的两个有效船位，两端经纬度齐全、间隔大于零且大圆距离折算的平均航速
+**严格超过 50 节**时记一条航段，由 `GET /jump-segments` 查询（来源、MMSI、起止时间与坐标、
+距离与平均航速，按终点时间、MMSI、来源排序，可按来源和 MMSI 筛选）。
 
 ## 功能
 
@@ -119,7 +122,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q          # 142 个单元/集成测试
+pytest -q          # 162 个单元/集成测试
 ```
 
 ## API
@@ -540,6 +543,94 @@ curl -s 'http://localhost:8000/position-conflicts'   # 仍为 []
 三个来源同刻两两超限时，清单包含全部 3 条来源对；作废其中一个点只移除**涉及它**的两条，
 其余来源对保留。冲突清单与轨迹写入、核定状态翻转或作废**同一事务**提交——任一步失败整体
 回滚，不留部分更新；数据持久化于 SQLite，重启后结果一致，旧版数据库打开时由现存轨迹整表重建。
+
+### `GET /jump-segments`（疑似跳跃航段清单）
+
+同一来源、同一 MMSI 的轨迹中，按 `observed_at` **相邻的两个有效船位**，只要两端经纬度齐全、
+时间间隔大于零、且大圆距离（haversine，地球半径 6371 km）折算的平均航速**严格超过 50 节**
+（恰好 50 节不算），清单中就有一条疑似跳跃航段。缺测点（经纬度为 `null`）仍留在轨迹里，
+但**不会跨过它拼接航段**。
+
+两个查询参数均可选（省略则列出全部）：
+
+```
+GET /jump-segments
+GET /jump-segments?source_id=ais-receiver-1
+GET /jump-segments?source_id=ais-receiver-1&mmsi=366999999
+```
+
+返回按 **终点时间、MMSI、来源** 排序的数组，每条含来源、MMSI、起止时间与坐标、距离和
+平均航速：
+
+```json
+[
+  {
+    "source_id": "ais-receiver-1",
+    "mmsi": 366999999,
+    "start": { "observed_at": "2026-10-05T11:00:00Z", "longitude": -73.9835, "latitude": 40.7484 },
+    "end":   { "observed_at": "2026-10-05T12:00:00Z", "longitude": -73.9835, "latitude": 41.6482 },
+    "distance_m": 100053.195,
+    "average_speed_knots": 54.024
+  }
+]
+```
+
+| 语义 | 是否产生航段 |
+| ---- | ---- |
+| 相邻有效船位、经纬度齐全、间隔 > 0、平均航速严格 > 50 节 | 是 |
+| 平均航速 ≤ 50 节（恰好 50 节也不算） | 否 |
+| 任一端经纬度为 `null`（缺测点） | 否，且缺测点两侧不再相接（不跨点拼接） |
+| 已作废的轨迹点 | 否（不参与；作废后两侧重新相邻） |
+| 同刻重发 / 同源同刻第二条船位 | 否（`INSERT OR IGNORE`，先保存者唯一，清单不变） |
+| 待核定批、未选中的歧义候选 | 否 |
+
+#### 航段出现、拆开与接起的 HTTP 调用示例
+
+```bash
+# 1) 11:00 的船位（纽约近海）
+curl -s -X POST http://localhost:8000/ingest \
+  -H 'Content-Type: application/json' \
+  -d '{"observed_at":"2026-10-05T11:00:00Z",
+       "sentences":[{"source_id":"ais-receiver-1",
+                     "sentence":"!AIVDM,1,1,,A,15Mwqgh01DreE9HGD@44gkg40000,0*1C"}]}'
+
+# 2) 12:00 的船位在约 100 km 外 -> 平均航速约 54 节，清单出现一条疑似跳跃航段
+curl -s -X POST http://localhost:8000/ingest \
+  -H 'Content-Type: application/json' \
+  -d '{"observed_at":"2026-10-05T12:00:00Z",
+       "sentences":[{"source_id":"ais-receiver-1",
+                     "sentence":"!AIVDM,1,1,,A,15Mwqgh01DreE9HGm<v4gkg40000,0*0B"}]}'
+curl -s 'http://localhost:8000/jump-segments'
+# [{"source_id":"ais-receiver-1","mmsi":366999999,
+#   "start":{"observed_at":"2026-10-05T11:00:00Z","longitude":-73.9835,"latitude":40.7484},
+#   "end":{"observed_at":"2026-10-05T12:00:00Z","longitude":-73.9835,"latitude":41.6482},
+#   "distance_m":100053.195,"average_speed_knots":54.024}]
+
+# 3) 迟到的 11:30 船位（距 11:00 仅约 0.3 km）把原航段拆开：
+#    11:00->11:30 太慢不成段，只剩 11:30->12:00（约 108 节）
+curl -s -X POST http://localhost:8000/ingest \
+  -H 'Content-Type: application/json' \
+  -d '{"observed_at":"2026-10-05T11:30:00Z",
+       "sentences":[{"source_id":"ais-receiver-1",
+                     "sentence":"!AIVDM,1,1,,A,15Mwqgh01DreF9HGD@44gkg40000,0*1F"}]}'
+curl -s 'http://localhost:8000/jump-segments?source_id=ais-receiver-1&mmsi=366999999'
+# [{"source_id":"ais-receiver-1","mmsi":366999999,
+#   "start":{"observed_at":"2026-10-05T11:30:00Z","longitude":-73.980087,"latitude":40.7484},
+#   "end":{"observed_at":"2026-10-05T12:00:00Z","longitude":-73.9835,"latitude":41.6482},
+#   "distance_m":100053.602,"average_speed_knots":108.049}]
+
+# 4) 作废 11:30 的误报点 -> 两侧重新接起，恢复 11:00->12:00 一条
+curl -s -X POST http://localhost:8000/tracks/invalidate \
+  -H 'Content-Type: application/json' \
+  -d '{"source_id":"ais-receiver-1","mmsi":366999999,
+       "observed_at":"2026-10-05T11:30:00Z","reason":"接收站误报：岸站标校错误"}'
+curl -s 'http://localhost:8000/jump-segments'
+# 又回到 11:00->12:00 的一条（average_speed_knots 54.024）
+```
+
+歧义批**迟到核定**写入的旧船位同样会拆开落点处的航段；`POST /ingest/preview` 预演不会留下
+任何清单变动。清单与轨迹写入、核定状态翻转或作废**同一事务**提交——任一步失败整体回滚；
+数据持久化于 SQLite，重启后结果一致，旧版数据库打开时由现存轨迹整表重建。
 
 ### `POST /reviews`（建立待核定批）
 
@@ -977,6 +1068,27 @@ curl -s 'http://localhost:8000/vessels?source_id=ais-receiver-1&mmsi=366999999'
   判定直接基于**轨迹中未作废且经纬度齐全**的点，与 `/vessels` 最新快照无关，因此迟到核定
   即使不回滚快照也会补齐历史冲突。打开旧库时在迁移事务内由现存轨迹（含旧快照回填的唯一起点）
   整表重建，升级后即可查出冲突，且重复打开结果不变。
+- **疑似跳跃航段清单**：`jump_segment` 同样是轨迹的派生视图，主键为
+  `(source_id, mmsi, start_observed_at, end_observed_at)`，存起止坐标、大圆距离与
+  平均航速（节）。每个写入事务（`/ingest` 与核定）只删除并重算本批涉及的
+  `(source_id, mmsi)` 船的航段；作废事务重算被作废点所在的船。重算按 `observed_at`
+  取有效轨迹的相邻点对：任一端缺坐标或间隔非正都不成段（缺测点因此**断开**相邻关系，
+  不会被跨点拼接），距离折算平均航速严格大于 50 节才落表——迟到点自然**拆开**原航段、
+  作废中间点自然**接起**两侧，同刻重发与未选候选因轨迹不变而清单不变。打开旧库时
+  在迁移事务内由现存轨迹整表重建；预演在同一事务内执行同一套重算后整体回滚，
+  不留清单变动。
+- **疑似跳跃航段清单（`GET /jump-segments`）**：
+  - 对**同一 `source_id`、同一 MMSI** 的轨迹，按 `observed_at` 取**相邻两个有效船位**：
+    两端经纬度齐全、时间间隔大于零、且大圆距离（haversine，地球半径 6371 km）折算的
+    平均航速**严格超过 50 节**（恰好 50 节不算）时，清单中有一条疑似跳跃航段；
+  - **缺测点**（经纬度为 `null`）仍留在轨迹中，但**不得跨过它拼接航段**——它两侧的相邻对
+    都无法成段，它之前的点与它之后的点也不会被连成一段；
+  - **迟到入库或歧义批核定**在原航段中间插入新点时会**拆开**原航段（按新的相邻关系重算）；
+    **作废中间点**把它从有效轨迹中移除，两侧船位**重新接起**；同刻重发与未选中的歧义候选
+    不改变清单；
+  - 清单持久化在 SQLite，与轨迹写入、核定状态翻转、作废在**同一事务**提交（失败一并回滚），
+    `POST /ingest/preview` 预演**不留任何清单变动**；打开旧版数据库时由现存轨迹整表重建，
+    重启后查询结果一致。
 - **只读预演**：`POST /ingest/preview` 复用 `/ingest` 的请求模型、解码流水线与
   `_collect_writes` 写入序列，在 `SnapshotStore.preview_ingest` 中获取与正式写入
   （`apply_ingest`）完全相同的 `_write_message` + `_refresh_conflicts` 调用，只是整段包在
@@ -992,15 +1104,15 @@ curl -s 'http://localhost:8000/vessels?source_id=ais-receiver-1&mmsi=366999999'
 
 ```
 app/
-  main.py        # FastAPI 入口，POST /decode、/ingest、/ingest/preview、/tracks/invalidate、/reviews、GET /vessels、/tracks、/position-conflicts、/reviews、/health
-  models.py      # Pydantic 请求/响应模型（含快照、船位轨迹、误报标记、船位冲突、入库影响预演与核定批模型）
+  main.py        # FastAPI 入口，POST /decode、/ingest、/ingest/preview、/tracks/invalidate、/reviews、GET /vessels、/tracks、/position-conflicts、/jump-segments、/reviews、/health
+  models.py      # Pydantic 请求/响应模型（含快照、船位轨迹、误报标记、船位冲突、疑似跳跃航段、入库影响预演与核定批模型）
   nmea.py        # NMEA 0183 语句解析与校验（XOR 校验和、分片、fill bits）
   ais.py         # 六位 armour、位提取、消息 1/2/3 与 5 解码
   assembler.py   # 归组、乱序重组、孤儿分片池歧义枚举
-  storage.py     # SQLite 快照、船位轨迹（含旧库起点回填）、误报标记、船位冲突清单、只读入库预演（事务回滚）与核定批持久化（单事务）
+  storage.py     # SQLite 快照、船位轨迹（含旧库起点回填）、误报标记、船位冲突清单、疑似跳跃航段清单、只读入库预演（事务回滚）与核定批持久化（单事务）
 scripts/
   generate_examples.py  # 重新生成 README/测试中的示例报文
-tests/           # pytest 单元与 API 集成测试（含快照、轨迹时序语义、误报标记、船位冲突、只读预演与人工核定流程）
+tests/           # pytest 单元与 API 集成测试（含快照、轨迹时序语义、误报标记、船位冲突、疑似跳跃航段、只读预演与人工核定流程）
 Dockerfile
 docker-compose.yml      # 命名卷 ais-data 持久化 /data/ais.db
 requirements.txt / requirements-dev.txt

@@ -184,6 +184,17 @@ def main() -> None:
         ],
     }
 
+    # 5. suspected jump segment: the same vessel ~100 km north one hour
+    #    after the single-fragment position -> ~54 knots average speed.
+    payload, fill = armor(msg1_bits(
+        mmsi=366999999, lon=-73.9835, lat=41.6482,
+        sog=8.4, cog=121.5, heading=119, nav_status=0, timestamp=34,
+    ))
+    out["jump_segment_end"] = {
+        "sentences": [{"source_id": "ais-receiver-1",
+                       "sentence": sentence(1, 1, "", "A", payload, fill)}],
+    }
+
     json.dump(out, sys.stdout, indent=2)
     print()
 

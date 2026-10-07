@@ -412,6 +412,49 @@ class PositionConflict(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Suspected jump segments (consecutive valid track points implausibly fast)
+# ---------------------------------------------------------------------------
+
+class JumpSegmentEndpoint(BaseModel):
+    """One end of a suspected jump segment: the track point as stored."""
+
+    observed_at: datetime = Field(
+        ..., description="UTC observation time of the track point.")
+    longitude: float = Field(
+        ..., description="Degrees, taken from the stored track point.")
+    latitude: float = Field(
+        ..., description="Degrees, taken from the stored track point.")
+
+
+class JumpSegment(BaseModel):
+    """Two consecutive valid track points of one (source_id, MMSI) pair whose
+    implied average speed strictly exceeds 50 knots.
+
+    Only points actually stored (never invalidated) participate, and only
+    when both ends carry complete coordinates — a point with missing
+    coordinates stays in the track but breaks adjacency, so no segment is
+    stitched across it. Lists are ordered by end time, then MMSI, then
+    source id.
+    """
+
+    source_id: str
+    mmsi: int
+    start: JumpSegmentEndpoint = Field(
+        ..., description="Earlier of the two consecutive track points.")
+    end: JumpSegmentEndpoint = Field(
+        ..., description="Later of the two consecutive track points.")
+    distance_m: float = Field(
+        ..., description="Great-circle distance between the ends, in metres.")
+    average_speed_knots: float = Field(
+        ...,
+        description=(
+            "distance_m / 1852 divided by the time interval in hours; "
+            "strictly greater than 50."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Manual review of ambiguous batches
 # ---------------------------------------------------------------------------
 

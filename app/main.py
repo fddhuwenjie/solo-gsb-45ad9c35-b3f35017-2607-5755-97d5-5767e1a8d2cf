@@ -25,6 +25,7 @@ from .models import (
     IngestResponse,
     InvalidateRequest,
     InvalidatedTrackPoint,
+    JumpSegment,
     MessageData,
     PositionConflict,
     ReviewBatch,
@@ -79,7 +80,12 @@ app = FastAPI(
         "stored, valid, complete position reports of one MMSI disagree by "
         "more than one nautical mile (1852 m) great-circle distance; the "
         "list is maintained in the same transactions as track writes, "
-        "review resolution and invalidation and survives restarts."
+        "review resolution and invalidation and survives restarts. "
+        "GET /jump-segments lists suspected jump segments of one "
+        "(source_id, MMSI) track: two consecutive valid track points with "
+        "complete coordinates whose implied average speed strictly exceeds "
+        "50 knots; it is maintained in the same transactions and survives "
+        "restarts."
     ),
 )
 
@@ -380,6 +386,35 @@ def list_position_conflicts(
     source_id: Optional[str] = None, mmsi: Optional[int] = None
 ):
     return get_store().list_position_conflicts(source_id=source_id, mmsi=mmsi)
+
+
+@app.get(
+    "/jump-segments",
+    response_model=list[JumpSegment],
+    tags=["snapshots"],
+    description=(
+        "List suspected jump segments of the stored tracks: for one "
+        "(source_id, MMSI) pair, two consecutive valid track points "
+        "(ordered by observed_at) with complete coordinates on both ends, "
+        "a positive time interval and an implied average speed — "
+        "great-circle distance over time — strictly greater than 50 "
+        "knots. A track point with missing coordinates stays in the track "
+        "but breaks adjacency, so no segment is stitched across it. A "
+        "late observation or a late review resolution splits the segment "
+        "it lands in; invalidating a middle point joins its two "
+        "neighbours; a same-instant retransmission and an unchosen "
+        "ambiguous candidate change nothing. Ordered by end time, then "
+        "MMSI, then source id. Optional source_id and mmsi filters narrow "
+        "the list. The list is persisted in SQLite, is maintained in the "
+        "same transactions as track writes, review resolutions and "
+        "invalidations, and is identical after a restart; tracks stored "
+        "by an older database are listed once it is opened."
+    ),
+)
+def list_jump_segments(
+    source_id: Optional[str] = None, mmsi: Optional[int] = None
+):
+    return get_store().list_jump_segments(source_id=source_id, mmsi=mmsi)
 
 
 @app.post(
