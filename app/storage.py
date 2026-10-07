@@ -55,6 +55,20 @@ so older databases surface their conflicts after an upgrade and results
 stay identical across restarts. Invalidating one point removes exactly
 the pairs involving it; pairs of the other sources are kept.
 
+``track_jump``: one row per *suspected jump segment* of a single
+``(source_id, mmsi)`` track — two valid track points adjacent in
+``observed_at`` order whose great-circle distance and elapsed time imply
+an average speed strictly greater than 50 knots. Both ends must carry
+complete coordinates and a positive time gap; a valid point with missing
+coordinates stays in the track but breaks the chain, so no segment is
+stitched across it. The list is a derived view of ``vessel_track`` just
+like ``position_conflict``: every write path, every review resolution
+and every invalidation recomputes the affected tracks in the same
+transaction (a late point splits an existing segment, an invalidated
+middle point joins its neighbours), and opening any database rebuilds
+the whole list, so tracks already stored in an older database surface
+their jump segments after the upgrade.
+
 ``review_batch``: one row per manual-review batch created from an ambiguous
 batch of sentences. The original sentences and the full decode outcome
 (including every candidate of every ambiguous pool) are stored as JSON, so
@@ -91,6 +105,8 @@ from .models import (
     StaticAndVoyageData,
     TimedPositionReport,
     TimedStaticAndVoyageData,
+    TrackJump,
+    TrackJumpPoint,
     TrackPoint,
     VesselSnapshot,
 )
@@ -98,11 +114,20 @@ from .models import (
 KIND_POSITION = "position"
 KIND_STATIC = "static"
 
+# One knot is exactly one nautical mile (1852 m) per hour.
+METRES_PER_NAUTICAL_MILE = 1852.0
+
 # Two simultaneous reports of one MMSI are a conflict only when strictly
 # farther apart than one nautical mile (the haversine comparison is
 # ``>``; exactly 1852 m is not a conflict).
-CONFLICT_DISTANCE_METRES = 1852.0
+CONFLICT_DISTANCE_METRES = METRES_PER_NAUTICAL_MILE
 EARTH_RADIUS_METRES = 6_371_000.0
+
+# Two adjacent valid positions of one track are a suspected jump only
+# when the average speed implied by the great-circle distance and the
+# elapsed time is strictly greater than 50 knots (the comparison is
+# ``>``; exactly 50 knots is not a jump).
+JUMP_SPEED_KNOTS = 50.0
 
 # sentence_index recorded for track points backfilled from pre-existing
 # vessel_state rows of an older database (no earlier track is inferred).
@@ -152,6 +177,20 @@ CREATE TABLE IF NOT EXISTS position_conflict (
     latitude_b   REAL NOT NULL,
     distance_m   REAL NOT NULL,
     PRIMARY KEY (mmsi, observed_at, source_id_a, source_id_b)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS track_jump (
+    source_id         TEXT NOT NULL,
+    mmsi              INTEGER NOT NULL,
+    start_observed_at TEXT NOT NULL,
+    end_observed_at   TEXT NOT NULL,
+    start_longitude   REAL NOT NULL,
+    start_latitude    REAL NOT NULL,
+    end_longitude     REAL NOT NULL,
+    end_latitude      REAL NOT NULL,
+    distance_m        REAL NOT NULL,
+    speed_knots       REAL NOT NULL,
+    PRIMARY KEY (source_id, mmsi, start_observed_at, end_observed_at)
 ) WITHOUT ROWID;
 """
 
@@ -219,6 +258,31 @@ FROM vessel_track
 WHERE mmsi = ? AND observed_at = ? AND valid = 1
 """
 
+# The jump list is recomputed per (source_id, mmsi) track: the stored
+# segments of the track are deleted first, then every pair of adjacent
+# valid points whose implied average speed is strictly over 50 knots is
+# inserted. A valid point with missing coordinates breaks the chain: no
+# segment is stitched across it.
+_DELETE_JUMPS_FOR_VESSEL_SQL = """
+DELETE FROM track_jump
+WHERE source_id = ? AND mmsi = ?
+"""
+
+_VALID_TRACK_FOR_VESSEL_SQL = """
+SELECT observed_at, data
+FROM vessel_track
+WHERE source_id = ? AND mmsi = ? AND valid = 1
+ORDER BY observed_at, sentence_index
+"""
+
+_INSERT_JUMP_SQL = """
+INSERT INTO track_jump
+    (source_id, mmsi, start_observed_at, end_observed_at,
+     start_longitude, start_latitude, end_longitude, end_latitude,
+     distance_m, speed_knots)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
 
 def normalize_observed_at(value: datetime) -> str:
     """Fixed-width UTC ISO 8601 string; lexicographic order == time order."""
@@ -280,6 +344,11 @@ class SnapshotStore:
             # simultaneous reports are backfilled even when the track rows
             # already existed), and idempotently in every other case.
             self._rebuild_all_conflicts()
+            # The suspected-jump list is likewise a derived view of
+            # vessel_track: rebuild it wholesale on open so tracks already
+            # stored in an older database surface their jump segments after
+            # the upgrade, idempotently in every case.
+            self._rebuild_all_jumps()
 
     def close(self) -> None:
         with self._lock:
@@ -413,6 +482,91 @@ class SnapshotStore:
         }
         self._refresh_conflicts(groups)
 
+    # -- suspected jump segments ------------------------------------------------
+
+    def _refresh_jumps(self, vessels: set[tuple[str, int]]) -> None:
+        """Recompute every suspected jump segment of the given tracks.
+
+        For each ``(source_id, mmsi)`` the stored segments are deleted and
+        re-created from the adjacent pairs of the valid track points: a
+        pair is listed only when both ends carry complete coordinates, the
+        elapsed time is positive and the implied average speed is strictly
+        greater than 50 knots. A valid point with missing coordinates
+        stays in the track but breaks the chain — no segment is stitched
+        across it. The recomputation is a derived, idempotent view of
+        ``vessel_track``; the caller runs it inside the write transaction
+        so segment rows commit together with track writes, review status
+        or an invalidation (a failure rolls all back).
+        """
+        for source_id, mmsi in vessels:
+            self._conn.execute(_DELETE_JUMPS_FOR_VESSEL_SQL, (source_id, mmsi))
+            previous: Optional[tuple[str, float, float]] = None
+            for row in self._conn.execute(
+                _VALID_TRACK_FOR_VESSEL_SQL, (source_id, mmsi)
+            ):
+                coordinates = self._coordinates(row["data"])
+                if coordinates is None:
+                    # Missing coordinates: the point stays in the track but
+                    # no segment is stitched across it.
+                    previous = None
+                    continue
+                observed_at = row["observed_at"]
+                longitude, latitude = coordinates
+                if previous is not None:
+                    start_observed_at, start_lon, start_lat = previous
+                    seconds = (
+                        _parse_observed_at(observed_at)
+                        - _parse_observed_at(start_observed_at)
+                    ).total_seconds()
+                    if seconds > 0:
+                        distance = haversine_metres(
+                            start_lon, start_lat, longitude, latitude
+                        )
+                        speed = (
+                            distance
+                            / METRES_PER_NAUTICAL_MILE
+                            / (seconds / 3600.0)
+                        )
+                        if speed > JUMP_SPEED_KNOTS:
+                            self._conn.execute(
+                                _INSERT_JUMP_SQL,
+                                (
+                                    source_id, mmsi,
+                                    start_observed_at, observed_at,
+                                    start_lon, start_lat,
+                                    longitude, latitude,
+                                    distance, speed,
+                                ),
+                            )
+                previous = (observed_at, longitude, latitude)
+
+    def _rebuild_all_jumps(self) -> None:
+        """Recompute the full jump list from every stored track point."""
+        vessels = {
+            (row["source_id"], row["mmsi"])
+            for row in self._conn.execute(
+                "SELECT DISTINCT source_id, mmsi FROM vessel_track"
+            )
+        }
+        self._refresh_jumps(vessels)
+
+    @staticmethod
+    def _jump_from_row(row: sqlite3.Row) -> TrackJump:
+        return TrackJump(
+            source_id=row["source_id"],
+            mmsi=row["mmsi"],
+            start_observed_at=_parse_observed_at(row["start_observed_at"]),
+            start_point=TrackJumpPoint(
+                longitude=row["start_longitude"], latitude=row["start_latitude"]
+            ),
+            end_observed_at=_parse_observed_at(row["end_observed_at"]),
+            end_point=TrackJumpPoint(
+                longitude=row["end_longitude"], latitude=row["end_latitude"]
+            ),
+            distance_m=round(row["distance_m"], 3),
+            speed_knots=round(row["speed_knots"], 3),
+        )
+
     @staticmethod
     def _conflict_from_row(row: sqlite3.Row) -> PositionConflict:
         return PositionConflict(
@@ -543,6 +697,11 @@ class SnapshotStore:
                         sentence_index, affected=affected,
                     )
                 self._refresh_conflicts(affected)
+                # Same pipeline as apply_ingest: the dry run also recomputes
+                # the jump segments of the touched tracks (rolled back too).
+                self._refresh_jumps(
+                    {(w[0], w[1]) for w in writes if w[2] == KIND_POSITION}
+                )
 
                 after_rows: dict[tuple[str, int], list[sqlite3.Row]] = {
                     (source_id, mmsi): self._fetch_rows(source_id, mmsi)
@@ -649,6 +808,8 @@ class SnapshotStore:
                 source_id, mmsi, kind, observed_at, data, affected=affected
             )
             self._refresh_conflicts(affected)
+            if kind == KIND_POSITION:
+                self._refresh_jumps({(source_id, mmsi)})
             return changed
 
     def apply_ingest(
@@ -672,6 +833,9 @@ class SnapshotStore:
                     sentence_index, affected=affected,
                 )
             self._refresh_conflicts(affected)
+            self._refresh_jumps(
+                {(w[0], w[1]) for w in writes if w[2] == KIND_POSITION}
+            )
             return sorted({(w[0], w[1]) for w in writes})
 
     # -- reads ----------------------------------------------------------------
@@ -817,6 +981,37 @@ class SnapshotStore:
             rows = self._conn.execute(sql, params).fetchall()
         return [self._conflict_from_row(row) for row in rows]
 
+    # -- suspected jump segments ------------------------------------------------
+
+    def list_track_jumps(
+        self,
+        source_id: Optional[str] = None,
+        mmsi: Optional[int] = None,
+    ) -> list[TrackJump]:
+        """Stored suspected jump segments, ordered by end time, MMSI, source.
+
+        Each segment joins two valid track points of one ``(source_id,
+        mmsi)`` that are adjacent in ``observed_at`` order, both carry
+        complete coordinates and a positive time gap, and imply an average
+        speed strictly greater than 50 knots. An optional *source_id* or
+        *mmsi* filter narrows the list.
+        """
+        sql = "SELECT * FROM track_jump"
+        clauses: list[str] = []
+        params: list = []
+        if source_id is not None:
+            clauses.append("source_id = ?")
+            params.append(source_id)
+        if mmsi is not None:
+            clauses.append("mmsi = ?")
+            params.append(mmsi)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY end_observed_at, mmsi, source_id"
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [self._jump_from_row(row) for row in rows]
+
     # -- track point invalidation ----------------------------------------------
 
     def _fallback_position_snapshot(
@@ -921,6 +1116,9 @@ class SnapshotStore:
             # Pairs involving the now-invalid point are removed; pairs of
             # the other sources at this time are recomputed and kept.
             self._refresh_conflicts({(mmsi, observed_at)})
+            # The point leaves the valid sequence: the neighbours it
+            # separated become adjacent and their segment is re-evaluated.
+            self._refresh_jumps({(source_id, mmsi)})
             return point, reason, invalidated_at
 
     # -- review batches -------------------------------------------------------
@@ -994,6 +1192,11 @@ class SnapshotStore:
             # A late resolution backfills historical conflicts even when
             # it does not change the latest /vessels snapshots.
             self._refresh_conflicts(affected)
+            # A position written between two existing points likewise
+            # splits their jump segment, even when the snapshot is unchanged.
+            self._refresh_jumps(
+                {(w[0], w[1]) for w in writes if w[2] == KIND_POSITION}
+            )
             involved = sorted({(w[0], w[1]) for w in writes})
             snapshots = [
                 self._to_snapshot(source_id, mmsi, self._fetch_rows(source_id, mmsi))

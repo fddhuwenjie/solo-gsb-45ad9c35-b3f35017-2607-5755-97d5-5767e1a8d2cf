@@ -34,6 +34,7 @@ from .models import (
     ReviewStatus,
     SentenceIn,
     Summary,
+    TrackJump,
     VesselSnapshot,
     VesselTrack,
 )
@@ -79,7 +80,12 @@ app = FastAPI(
         "stored, valid, complete position reports of one MMSI disagree by "
         "more than one nautical mile (1852 m) great-circle distance; the "
         "list is maintained in the same transactions as track writes, "
-        "review resolution and invalidation and survives restarts."
+        "review resolution and invalidation and survives restarts. "
+        "GET /track-jumps lists suspected jump segments within each "
+        "(source_id, MMSI) track: two adjacent still-valid positions with "
+        "complete coordinates whose implied average speed exceeds 50 "
+        "knots; it is maintained in the same transactions and survives "
+        "restarts too."
     ),
 )
 
@@ -380,6 +386,32 @@ def list_position_conflicts(
     source_id: Optional[str] = None, mmsi: Optional[int] = None
 ):
     return get_store().list_position_conflicts(source_id=source_id, mmsi=mmsi)
+
+
+@app.get(
+    "/track-jumps",
+    response_model=list[TrackJump],
+    tags=["snapshots"],
+    description=(
+        "List suspected jump segments within each (source_id, MMSI) "
+        "track: two still-valid stored positions adjacent in observed_at "
+        "order, both with complete coordinates and a positive time gap, "
+        "whose great-circle distance over the elapsed time implies an "
+        "average speed strictly greater than 50 knots. A valid point "
+        "with missing coordinates stays in the track but no segment is "
+        "stitched across it; a late ingest or review resolution splits "
+        "an existing segment, and invalidating a middle point joins its "
+        "neighbours into one. Same-instant retransmissions and unchosen "
+        "ambiguous candidates never change the list. Ordered by segment "
+        "end time, then MMSI, then source id; optional source_id and "
+        "mmsi filters narrow the list. The list is persisted in SQLite "
+        "and is identical after a restart."
+    ),
+)
+def list_track_jumps(
+    source_id: Optional[str] = None, mmsi: Optional[int] = None
+):
+    return get_store().list_track_jumps(source_id=source_id, mmsi=mmsi)
 
 
 @app.post(

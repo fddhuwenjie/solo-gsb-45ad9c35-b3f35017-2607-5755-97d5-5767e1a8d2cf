@@ -184,6 +184,16 @@ def main() -> None:
         ],
     }
 
+    # 5. suspected jump segment: ~111.2 km due north in one hour (~60 kn) ----
+    payload, fill = armor(msg1_bits(
+        mmsi=366999999, lon=-73.9835, lat=41.7484,
+        sog=8.4, cog=121.5, heading=119, nav_status=0, timestamp=34,
+    ))
+    out["track_jump"] = {
+        "sentences": [{"source_id": "ais-receiver-1",
+                       "sentence": sentence(1, 1, "", "A", payload, fill)}],
+    }
+
     json.dump(out, sys.stdout, indent=2)
     print()
 

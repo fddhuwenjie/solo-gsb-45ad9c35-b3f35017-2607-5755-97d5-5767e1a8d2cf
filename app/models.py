@@ -412,6 +412,45 @@ class PositionConflict(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Suspected jump segments within one track
+# ---------------------------------------------------------------------------
+
+class TrackJumpPoint(BaseModel):
+    """Coordinates of one end of a suspected jump segment, as stored."""
+
+    longitude: float = Field(
+        ..., description="Degrees, taken from the stored track point.")
+    latitude: float = Field(
+        ..., description="Degrees, taken from the stored track point.")
+
+
+class TrackJump(BaseModel):
+    """Two adjacent valid positions of one (source_id, MMSI) track whose
+    implied average speed is strictly greater than 50 knots.
+
+    Only track points actually stored (never invalidated) participate, and
+    only pairs adjacent in ``observed_at`` order: a valid point with missing
+    coordinates stays in the track, but no segment is stitched across it.
+    Lists are ordered by segment end time, then MMSI, then source id.
+    """
+
+    source_id: str
+    mmsi: int
+    start_observed_at: datetime = Field(
+        ..., description="UTC observation time of the segment's first point.")
+    start_point: TrackJumpPoint = Field(
+        ..., description="Coordinates of the segment's first point.")
+    end_observed_at: datetime = Field(
+        ..., description="UTC observation time of the segment's second point.")
+    end_point: TrackJumpPoint = Field(
+        ..., description="Coordinates of the segment's second point.")
+    distance_m: float = Field(
+        ..., description="Great-circle distance between the two points, in metres.")
+    speed_knots: float = Field(
+        ..., description="Average speed over the segment, in knots; strictly > 50.")
+
+
+# ---------------------------------------------------------------------------
 # Manual review of ambiguous batches
 # ---------------------------------------------------------------------------
 
